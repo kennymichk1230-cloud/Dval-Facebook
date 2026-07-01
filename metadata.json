@@ -1,0 +1,6 @@
+{
+  "name": "Dval Facebook Lite",
+  "description": "A standalone, lightweight Facebook browser using WebView with support for camera, media upload, file download, and dark mode.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
