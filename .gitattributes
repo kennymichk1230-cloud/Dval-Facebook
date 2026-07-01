@@ -22,5 +22,7 @@
 *.md text
 *.json text
 
-# Declare files that should always use CRLF line endings
+# Declare files that should always use specific line endings
+gradlew text eol=lf
 *.bat text eol=crlf
+gradle-wrapper.properties text eol=lf
