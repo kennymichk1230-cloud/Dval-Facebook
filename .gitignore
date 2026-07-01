@@ -16,3 +16,8 @@
 local.properties
 .env
 debug.keystore
+
+# Explicitly unignore Gradle Wrapper jar and properties
+!/gradle/wrapper/gradle-wrapper.jar
+!/gradle/wrapper/gradle-wrapper.properties
+
