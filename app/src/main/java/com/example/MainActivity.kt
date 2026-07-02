@@ -57,6 +57,13 @@ import androidx.core.content.FileProvider
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.example.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.delay
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.testTag
 import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -118,6 +125,30 @@ class MainActivity : ComponentActivity() {
                 var isDesktopSite by remember { mutableStateOf(false) }
                 var showMenu by remember { mutableStateOf(false) }
                 var currentUrl by remember { mutableStateOf("https://m.facebook.com") }
+                var urlInputText by remember { mutableStateOf("https://m.facebook.com") }
+
+                LaunchedEffect(currentUrl) {
+                    urlInputText = currentUrl
+                }
+
+                fun navigateToUrl(input: String) {
+                    var targetUrl = input.trim()
+                    if (targetUrl.isEmpty()) return
+                    
+                    // If it's a sub-page of facebook (e.g. "messages", "/messages", "notifications")
+                    if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://") && !targetUrl.contains(".")) {
+                        val cleanPath = if (targetUrl.startsWith("/")) targetUrl.substring(1) else targetUrl
+                        targetUrl = if (isDesktopSite) {
+                            "https://www.facebook.com/$cleanPath"
+                        } else {
+                            "https://m.facebook.com/$cleanPath"
+                        }
+                    } else if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+                        targetUrl = "https://$targetUrl"
+                    }
+                    
+                    webViewInstance?.loadUrl(targetUrl)
+                }
 
                 // Dismiss splash screen after 2.5s
                 LaunchedEffect(Unit) {
@@ -186,17 +217,63 @@ class MainActivity : ComponentActivity() {
                                 Icon(
                                     imageVector = Icons.Default.Lock,
                                     contentDescription = "Secure Lock",
-                                    tint = Color(0xFFCAC4D0),
+                                    tint = Color(0xFFD0BCFF),
                                     modifier = Modifier.size(14.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (isDesktopSite) "m.facebook.com (Desktop)" else "m.facebook.com",
-                                    style = MaterialTheme.typography.bodySmall.copy(
-                                        color = Color(0xFFCAC4D0),
+                                
+                                BasicTextField(
+                                    value = urlInputText,
+                                    onValueChange = { urlInputText = it },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("url_input_field"),
+                                    singleLine = true,
+                                    textStyle = androidx.compose.ui.text.TextStyle(
+                                        color = Color.White,
+                                        fontSize = 13.sp,
                                         fontWeight = FontWeight.Medium
-                                    )
+                                    ),
+                                    keyboardOptions = KeyboardOptions(
+                                        keyboardType = KeyboardType.Uri,
+                                        imeAction = ImeAction.Go
+                                    ),
+                                    keyboardActions = KeyboardActions(
+                                        onGo = {
+                                            navigateToUrl(urlInputText)
+                                        }
+                                    ),
+                                    cursorBrush = SolidColor(Color(0xFFD0BCFF)),
+                                    decorationBox = { innerTextField ->
+                                        Box(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            contentAlignment = Alignment.CenterStart
+                                        ) {
+                                            if (urlInputText.isEmpty()) {
+                                                Text(
+                                                    text = "Enter URL or page...",
+                                                    color = Color(0xFFCAC4D0).copy(alpha = 0.6f),
+                                                    style = MaterialTheme.typography.bodySmall
+                                                )
+                                            }
+                                            innerTextField()
+                                        }
+                                    }
                                 )
+
+                                if (urlInputText.isNotEmpty()) {
+                                    IconButton(
+                                        onClick = { navigateToUrl(urlInputText) },
+                                        modifier = Modifier.size(24.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ArrowForward,
+                                            contentDescription = "Navigate to URL",
+                                            tint = Color(0xFFD0BCFF),
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
                             }
 
                             // Refresh button
