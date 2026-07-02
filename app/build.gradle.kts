@@ -23,36 +23,13 @@ android {
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
-  // Dynamically generate a release keystore if it doesn't exist to ensure a fully automated and signed release build.
-  val keystoreFile = file("${rootDir}/my-upload-key.jks")
-  if (!keystoreFile.exists()) {
-    println("Generating release keystore...")
-    try {
-      val pb = ProcessBuilder(
-        "keytool", "-genkeypair", "-v",
-        "-keystore", keystoreFile.absolutePath,
-        "-keyalg", "RSA",
-        "-keysize", "2048",
-        "-validity", "10000",
-        "-alias", "upload",
-        "-storepass", "android",
-        "-keypass", "android",
-        "-dname", "CN=Dval, O=AIStudio, C=US"
-      )
-      val process = pb.start()
-      process.waitFor()
-      println("Keystore generated. Exit code: ${process.exitValue()}")
-    } catch (e: Exception) {
-      e.printStackTrace()
-    }
-  }
-
   signingConfigs {
     create("release") {
-      storeFile = keystoreFile
-      storePassword = "android"
-      keyAlias = "upload"
-      keyPassword = "android"
+      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/app/release.jks"
+      storeFile = file(keystorePath)
+      storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "dummy"
+      keyAlias = System.getenv("KEY_ALIAS") ?: "dummy"
+      keyPassword = System.getenv("KEY_PASSWORD") ?: "dummy"
     }
   }
 
