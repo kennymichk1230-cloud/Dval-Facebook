@@ -25,11 +25,18 @@ android {
 
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/app/release.jks"
+      val envPath = System.getenv("KEYSTORE_PATH")
+      val keystorePath = if (envPath.isNullOrEmpty()) "${rootDir}/app/release.jks" else envPath
       storeFile = file(keystorePath)
-      storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "dummy"
-      keyAlias = System.getenv("KEY_ALIAS") ?: "dummy"
-      keyPassword = System.getenv("KEY_PASSWORD") ?: "dummy"
+
+      val storePass = System.getenv("KEYSTORE_PASSWORD")
+      storePassword = if (storePass.isNullOrEmpty()) "dummy" else storePass
+
+      val alias = System.getenv("KEY_ALIAS")
+      keyAlias = if (alias.isNullOrEmpty()) "dummy" else alias
+
+      val keyPass = System.getenv("KEY_PASSWORD")
+      keyPassword = if (keyPass.isNullOrEmpty()) storePassword else keyPass
     }
   }
 
@@ -39,7 +46,14 @@ android {
       isMinifyEnabled = true
       isShrinkResources = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("release")
+      
+      val envPath = System.getenv("KEYSTORE_PATH")
+      val keystorePath = if (envPath.isNullOrEmpty()) "${rootDir}/app/release.jks" else envPath
+      if (file(keystorePath).exists()) {
+        signingConfig = signingConfigs.getByName("release")
+      } else {
+        signingConfig = signingConfigs.getByName("debug")
+      }
     }
     debug {
     }
