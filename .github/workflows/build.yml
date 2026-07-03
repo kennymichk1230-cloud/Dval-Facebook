@@ -22,30 +22,22 @@ jobs:
           distribution: 'temurin'
           cache: 'gradle'
 
-      - name: Heal Gradle Wrapper (Fix corrupt or missing Jar)
+      - name: Heal Gradle Wrapper
         run: |
-          echo "Checking and healing Gradle Wrapper..."
           mkdir -p gradle/wrapper
-          
-          # Attempt to download a pristine gradle-wrapper.jar from official Gradle sources.
-          # We use curl with -f (fail) so that it returns a non-zero exit code if the URL 404s,
-          # allowing the fallback to the master branch to execute correctly. This bypasses
-          # any binary corruption from phone uploads or Git line-ending conversion issues.
-          curl -f -sSL -o gradle/wrapper/gradle-wrapper.jar "https://raw.githubusercontent.com/gradle/gradle/v9.3.1/gradle/wrapper/gradle-wrapper.jar" || \
           curl -f -sSL -o gradle/wrapper/gradle-wrapper.jar "https://raw.githubusercontent.com/gradle/gradle/master/gradle/wrapper/gradle-wrapper.jar"
-          
-          # Ensure execution permission for the Gradle wrapper script
           chmod +x gradlew
 
-      - name: Build with Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: wrapper
-
       - name: Decode Keystore
-        if: ${{ secrets.SIGNING_KEY != '' }}
         run: |
-          echo -n "${{ secrets.SIGNING_KEY }}" | base64 --decode > app/release.jks
+          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > app/release.jks
+
+      - name: Verify Keystore
+        run: |
+          ls -lh app/release.jks
+          keytool -list -v \
+            -keystore app/release.jks \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD }}"
 
       - name: Build Release APK
         env:
@@ -53,10 +45,10 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: ./gradlew assembleRelease
+        run: ./gradlew assembleRelease --stacktrace
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
           name: release-apk
-          path: app/build/outputs/apk/release/app-release.apk
+          path: app/build/outputs/apk/release/*.apk
