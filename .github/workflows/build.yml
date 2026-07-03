@@ -25,30 +25,16 @@ jobs:
       - name: Heal Gradle Wrapper
         run: |
           mkdir -p gradle/wrapper
-          curl -f -sSL -o gradle/wrapper/gradle-wrapper.jar "https://raw.githubusercontent.com/gradle/gradle/master/gradle/wrapper/gradle-wrapper.jar"
+          curl -f -sSL -o gradle/wrapper/gradle-wrapper.jar https://raw.githubusercontent.com/gradle/gradle/master/gradle/wrapper/gradle-wrapper.jar
           chmod +x gradlew
 
-      - name: Decode Keystore
-        run: |
-          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > app/release.jks
-
-      - name: Verify Keystore
-        run: |
-          ls -lh app/release.jks
-          keytool -list -v \
-            -keystore app/release.jks \
-            -storepass "${{ secrets.KEYSTORE_PASSWORD }}"
-
       - name: Build Release APK
-        env:
-          KEYSTORE_PATH: ${{ github.workspace }}/app/release.jks
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: ./gradlew assembleRelease --stacktrace
+        run: ./gradlew clean assembleRelease --stacktrace
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
           name: release-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/*.aab
