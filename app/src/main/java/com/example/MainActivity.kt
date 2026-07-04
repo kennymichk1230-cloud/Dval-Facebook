@@ -120,25 +120,69 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun performUpdateCheck(urlStr: String): UpdateInfo? {
+    fun isNewerVersion(current: String, latest: String): Boolean {
+        val cleanCurrent = current.trim().removePrefix("v").removePrefix("V").trim()
+        val cleanLatest = latest.trim().removePrefix("v").removePrefix("V").trim()
+        
+        val currentParts = cleanCurrent.split(".")
+        val latestParts = cleanLatest.split(".")
+        
+        val maxLength = maxOf(currentParts.size, latestParts.size)
+        for (i in 0 until maxLength) {
+            val currentPart = currentParts.getOrNull(i)?.toIntOrNull() ?: 0
+            val latestPart = latestParts.getOrNull(i)?.toIntOrNull() ?: 0
+            if (latestPart > currentPart) {
+                return true
+            } else if (currentPart > latestPart) {
+                return false
+            }
+        }
+        return false
+    }
+
+    private suspend fun performUpdateCheck(): UpdateInfo? {
         return withContext(Dispatchers.IO) {
             var connection: HttpURLConnection? = null
             try {
-                val url = URL(urlStr)
+                val url = URL("https://api.github.com/repos/kennymichk1230-cloud/Dval-Facebook/releases/latest")
                 connection = url.openConnection() as HttpURLConnection
-                connection.connectTimeout = 8000
-                connection.readTimeout = 8000
+                connection.connectTimeout = 10000
+                connection.readTimeout = 10000
                 connection.requestMethod = "GET"
+                connection.setRequestProperty("User-Agent", "Dval-Facebook-Updater")
+                connection.setRequestProperty("Accept", "application/vnd.github.v3+json")
                 
                 if (connection.responseCode == HttpURLConnection.HTTP_OK) {
                     val jsonText = connection.inputStream.bufferedReader().use { it.readText() }
                     val json = JSONObject(jsonText)
-                    UpdateInfo(
-                        versionCode = json.getInt("versionCode"),
-                        versionName = json.getString("versionName"),
-                        downloadUrl = json.getString("downloadUrl"),
-                        updateMessage = json.optString("updateMessage", "A new version of the app is available. Please update to continue enjoying the latest features.")
-                    )
+                    val tagName = json.getString("tag_name")
+                    val body = json.optString("body", "A new update is available for FB Lite.")
+                    
+                    val assets = json.optJSONArray("assets")
+                    var downloadUrl = ""
+                    if (assets != null) {
+                        for (i in 0 until assets.length()) {
+                            val asset = assets.getJSONObject(i)
+                            val name = asset.optString("name", "")
+                            if (name == "app-release.apk") {
+                                downloadUrl = asset.getString("browser_download_url")
+                                break
+                            } else if (name.endsWith(".apk") && downloadUrl.isEmpty()) {
+                                downloadUrl = asset.getString("browser_download_url")
+                            }
+                        }
+                    }
+                    
+                    if (downloadUrl.isNotEmpty()) {
+                        UpdateInfo(
+                            versionCode = 0,
+                            versionName = tagName,
+                            downloadUrl = downloadUrl,
+                            updateMessage = body
+                        )
+                    } else {
+                        null
+                    }
                 } else {
                     null
                 }
@@ -151,57 +195,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun downloadUpdateApk(
-        downloadUrl: String,
-        destFile: File,
-        onProgress: (Float, Long, Long) -> Unit
-    ) {
-        withContext(Dispatchers.IO) {
-            var connection: HttpURLConnection? = null
-            try {
-                if (destFile.exists()) {
-                    destFile.delete()
-                }
-                
-                val url = URL(downloadUrl)
-                connection = url.openConnection() as HttpURLConnection
-                connection.connectTimeout = 15000
-                connection.readTimeout = 30000
-                connection.connect()
-
-                if (connection.responseCode != HttpURLConnection.HTTP_OK) {
-                    throw IOException("Server returned HTTP ${connection.responseCode}")
-                }
-
-                val length = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    connection.contentLengthLong
-                } else {
-                    connection.contentLength.toLong()
-                }
-
-                connection.inputStream.use { input ->
-                    destFile.outputStream().use { output ->
-                        val buffer = ByteArray(4096)
-                        var total: Long = 0
-                        var count: Int
-                        while (input.read(buffer).also { count = it } != -1) {
-                            if (!coroutineContext.isActive) {
-                                throw IOException("Download cancelled")
-                            }
-                            total += count
-                            output.write(buffer, 0, count)
-                            onProgress(
-                                if (length > 0) total.toFloat() / length else -1f,
-                                total,
-                                length
-                            )
-                        }
-                    }
-                }
-            } finally {
-                connection?.disconnect()
-            }
-        }
+    private suspend fun performUpdateCheck(urlStr: String): UpdateInfo? {
+        return performUpdateCheck()
     }
 
     private fun triggerInstall(context: Context, file: File) {
@@ -298,8 +293,8 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(Unit) {
                     delay(3500) // Let splash screen load cleanly
                     coroutineScope.launch {
-                        val info = performUpdateCheck("https://raw.githubusercontent.com/sheilaj08102/fb-lite-updater/main/update.json")
-                        if (info != null && info.versionCode > currentVersionCode) {
+                        val info = performUpdateCheck()
+                        if (info != null && isNewerVersion(currentVersionName, info.versionName)) {
                             updateState = UpdateSystemState.UpdateAvailable(info)
                         }
                     }
@@ -312,19 +307,55 @@ class MainActivity : ComponentActivity() {
                     
                     updateJob = coroutineScope.launch {
                         try {
-                            val apkFile = File(context.cacheDir, "app-update.apk")
-                            downloadUpdateApk(info.downloadUrl, apkFile) { progress, totalBytes, totalLength ->
-                                updateProgress = progress
-                                val currentMb = totalBytes.toFloat() / (1024 * 1024)
-                                val totalMb = totalLength.toFloat() / (1024 * 1024)
-                                val percent = progress * 100
-                                downloadedBytesStr = if (totalLength > 0) {
-                                    String.format(Locale.getDefault(), "%.2f MB / %.2f MB (%.0f%%)", currentMb, totalMb, percent)
-                                } else {
-                                    String.format(Locale.getDefault(), "%.2f MB downloaded", currentMb)
-                                }
+                            val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                            val destFile = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "app-update.apk")
+                            if (destFile.exists()) {
+                                destFile.delete()
                             }
-                            updateState = UpdateSystemState.ReadyToInstall(info, apkFile)
+                            
+                            val request = DownloadManager.Request(Uri.parse(info.downloadUrl)).apply {
+                                setTitle("FB Lite Update v${info.versionName}")
+                                setDescription("Downloading new update from GitHub Releases")
+                                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                setDestinationInExternalFilesDir(context, Environment.DIRECTORY_DOWNLOADS, "app-update.apk")
+                            }
+                            
+                            val downloadId = downloadManager.enqueue(request)
+                            
+                            var downloading = true
+                            while (downloading && isActive) {
+                                delay(500)
+                                val query = DownloadManager.Query().setFilterById(downloadId)
+                                val cursor = downloadManager.query(query)
+                                if (cursor != null && cursor.moveToFirst()) {
+                                    val bytesDownloaded = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
+                                    val bytesTotal = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+                                    val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                                    
+                                    if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                                        downloading = false
+                                        updateProgress = 1f
+                                        updateState = UpdateSystemState.ReadyToInstall(info, destFile)
+                                    } else if (status == DownloadManager.STATUS_FAILED) {
+                                        downloading = false
+                                        val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+                                        throw IOException("Download failed via DownloadManager. Reason code: $reason")
+                                    } else if (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING) {
+                                        if (bytesTotal > 0) {
+                                            updateProgress = bytesDownloaded.toFloat() / bytesTotal
+                                            val currentMb = bytesDownloaded.toFloat() / (1024 * 1024)
+                                            val totalMb = bytesTotal.toFloat() / (1024 * 1024)
+                                            val percent = updateProgress * 100
+                                            downloadedBytesStr = String.format(Locale.getDefault(), "%.2f MB / %.2f MB (%.0f%%)", currentMb, totalMb, percent)
+                                        } else {
+                                            updateProgress = -1f
+                                            val currentMb = bytesDownloaded.toFloat() / (1024 * 1024)
+                                            downloadedBytesStr = String.format(Locale.getDefault(), "%.2f MB downloaded", currentMb)
+                                        }
+                                    }
+                                }
+                                cursor?.close()
+                            }
                         } catch (e: Exception) {
                             if (e is java.io.InterruptedIOException || e.message?.contains("cancelled") == true) {
                                 updateState = UpdateSystemState.Idle
@@ -579,8 +610,8 @@ class MainActivity : ComponentActivity() {
                                         showMenu = false
                                         coroutineScope.launch {
                                             Toast.makeText(this@MainActivity, "Checking for updates...", Toast.LENGTH_SHORT).show()
-                                            val info = performUpdateCheck("https://raw.githubusercontent.com/sheilaj08102/fb-lite-updater/main/update.json")
-                                            if (info != null && info.versionCode > currentVersionCode) {
+                                            val info = performUpdateCheck()
+                                            if (info != null && isNewerVersion(currentVersionName, info.versionName)) {
                                                 updateState = UpdateSystemState.UpdateAvailable(info)
                                             } else {
                                                 Toast.makeText(this@MainActivity, "No updates available (Current version is up-to-date: v$currentVersionName)", Toast.LENGTH_LONG).show()
