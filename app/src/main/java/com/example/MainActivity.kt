@@ -92,6 +92,48 @@ class MainActivity : ComponentActivity() {
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var cameraPhotoPath: String? = null
 
+    // Video download variables and launcher
+    private var pendingVideoDownload: PendingVideoDownload? = null
+    private var globalOnVideoUrlDetected: ((PendingVideoDownload) -> Unit)? = null
+
+    private val storagePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            pendingVideoDownload?.let {
+                executeVideoDownload(it.url, it.userAgent, it.contentDisposition, it.mimetype)
+            }
+        } else {
+            Toast.makeText(this, "Storage permission is required to download video", Toast.LENGTH_SHORT).show()
+        }
+        pendingVideoDownload = null
+    }
+
+    inner class VideoWebInterface {
+        @JavascriptInterface
+        fun onVideoDetected(url: String) {
+            runOnUiThread {
+                if (url.isNotEmpty() && (url.startsWith("http://") || url.startsWith("https://"))) {
+                    globalOnVideoUrlDetected?.invoke(
+                        PendingVideoDownload(
+                            url = url,
+                            userAgent = webViewInstance?.settings?.userAgentString,
+                            contentDisposition = null,
+                            mimetype = "video/mp4"
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    data class PendingVideoDownload(
+        val url: String,
+        val userAgent: String?,
+        val contentDisposition: String?,
+        val mimetype: String?
+    )
+
     // Notification and update callbacks
     private val webViewDownloadsMap = mutableMapOf<Long, String>()
     private var updateDownloadId: Long = -1L
@@ -554,6 +596,9 @@ class MainActivity : ComponentActivity() {
 
                 // --- Self-Update System States ---
                 var updateState by remember { mutableStateOf<UpdateSystemState>(UpdateSystemState.Idle) }
+                
+                // --- Video Download States ---
+                var activeVideoDownloadPrompt by remember { mutableStateOf<PendingVideoDownload?>(null) }
                 var updateProgress by remember { mutableStateOf(0f) }
                 var downloadedBytesStr by remember { mutableStateOf("") }
                 var updateJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
@@ -677,6 +722,9 @@ class MainActivity : ComponentActivity() {
                     }
                     onUpdateDownloadFailed = { errorStr, info ->
                         updateState = UpdateSystemState.Error(errorStr, info)
+                    }
+                    globalOnVideoUrlDetected = { pendingVideo ->
+                        activeVideoDownloadPrompt = pendingVideo
                     }
                 }
 
@@ -1006,6 +1054,65 @@ class MainActivity : ComponentActivity() {
                             updateState = UpdateSystemState.Idle
                         }
                     )
+
+                    // Video Download Prompt Dialog
+                    if (activeVideoDownloadPrompt != null) {
+                        val promptInfo = activeVideoDownloadPrompt!!
+                        AlertDialog(
+                            onDismissRequest = { activeVideoDownloadPrompt = null },
+                            title = {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Default.PlayArrow,
+                                        contentDescription = "Video Download Icon",
+                                        tint = Color(0xFFD0BCFF),
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "Download Video",
+                                        color = Color.White,
+                                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                                    )
+                                }
+                            },
+                            text = {
+                                Text(
+                                    text = "Would you like to download this video to your device's Downloads folder?",
+                                    color = Color(0xFFCAC4D0),
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            },
+                            confirmButton = {
+                                Button(
+                                    onClick = {
+                                        checkAndDownloadVideo(
+                                            promptInfo.url,
+                                            promptInfo.userAgent,
+                                            promptInfo.contentDisposition,
+                                            promptInfo.mimetype
+                                        )
+                                        activeVideoDownloadPrompt = null
+                                    },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = Color(0xFFD0BCFF),
+                                        contentColor = Color(0xFF21005D)
+                                    )
+                                ) {
+                                    Text("Download", fontWeight = FontWeight.Bold)
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(
+                                    onClick = { activeVideoDownloadPrompt = null }
+                                ) {
+                                    Text("Cancel", color = Color(0xFFCAC4D0))
+                                }
+                            },
+                            containerColor = Color(0xFF2B2930),
+                            shape = RoundedCornerShape(16.dp)
+                        )
+                    }
                 }
             }
         }
@@ -1025,21 +1132,74 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    private fun checkAndDownloadVideo(url: String, userAgent: String?, contentDisposition: String?, mimetype: String?) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            val permission = Manifest.permission.WRITE_EXTERNAL_STORAGE
+            if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+                pendingVideoDownload = PendingVideoDownload(url, userAgent, contentDisposition, mimetype)
+                storagePermissionLauncher.launch(permission)
+                return
+            }
+        }
+        executeVideoDownload(url, userAgent, contentDisposition, mimetype)
+    }
+
+    private fun executeVideoDownload(url: String, userAgent: String?, contentDisposition: String?, mimetype: String?) {
+        try {
+            val guessedName = URLUtil.guessFileName(url, contentDisposition, mimetype)
+            val filename = if (guessedName.endsWith(".bin") || !guessedName.contains(".")) {
+                "video_" + System.currentTimeMillis() + ".mp4"
+            } else {
+                guessedName
+            }
+
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                mimetype?.let { setMimeType(it) } ?: setMimeType("video/mp4")
+                val cookies = CookieManager.getInstance().getCookie(url)
+                if (!cookies.isNullOrEmpty()) {
+                    addRequestHeader("cookie", cookies)
+                }
+                if (!userAgent.isNullOrEmpty()) {
+                    addRequestHeader("User-Agent", userAgent)
+                }
+                setDescription("Downloading video $filename...")
+                setTitle(filename)
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(
+                    Environment.DIRECTORY_DOWNLOADS,
+                    filename
+                )
+            }
+
+            val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            val id = dm.enqueue(request)
+            webViewDownloadsMap[id] = filename
+            
+            showNotification(
+                notificationId = id.toInt(),
+                title = "Video Download Started",
+                text = "Downloading $filename...",
+                icon = android.R.drawable.stat_sys_download,
+                soundAndVibrate = true
+            )
+            Toast.makeText(this, "Downloading video...", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            showNotification(
+                notificationId = System.currentTimeMillis().toInt(),
+                title = "Video Download Failed",
+                text = "Could not start download: ${e.message}",
+                icon = android.R.drawable.stat_notify_error,
+                soundAndVibrate = true
+            )
+            Toast.makeText(this, "Video download failed: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     private fun requestRequiredPermissions() {
         val permissions = mutableListOf(
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO
         )
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
-            permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
-        } else {
-            @Suppress("DEPRECATION")
-            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-            @Suppress("DEPRECATION")
-            permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-        }
 
         val neededPermissions = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
@@ -1074,6 +1234,8 @@ class MainActivity : ComponentActivity() {
                             ViewGroup.LayoutParams.MATCH_PARENT,
                             ViewGroup.LayoutParams.MATCH_PARENT
                         )
+
+                        addJavascriptInterface(VideoWebInterface(), "VideoApp")
 
                         settings.apply {
                             javaScriptEnabled = true
@@ -1116,6 +1278,42 @@ class MainActivity : ComponentActivity() {
                                 super.onPageFinished(view, url)
                                 isRefreshing = false
                                 url?.let { onPageFinished(it) }
+
+                                // Inject video detection script
+                                view?.evaluateJavascript(
+                                    """
+                                    (function() {
+                                        function setupVideoListeners() {
+                                            var videos = document.getElementsByTagName('video');
+                                            for (var i = 0; i < videos.length; i++) {
+                                                var v = videos[i];
+                                                if (!v.getAttribute('data-download-listener-added')) {
+                                                    v.setAttribute('data-download-listener-added', 'true');
+                                                    
+                                                    // Listen for click/tap
+                                                    v.addEventListener('click', function() {
+                                                        var src = this.currentSrc || this.src;
+                                                        if (src) {
+                                                            VideoApp.onVideoDetected(src);
+                                                        }
+                                                    });
+                                                    
+                                                    // Listen for play as fallback
+                                                    v.addEventListener('play', function() {
+                                                        var src = this.currentSrc || this.src;
+                                                        if (src) {
+                                                            VideoApp.onVideoDetected(src);
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        setInterval(setupVideoListeners, 2000);
+                                        setupVideoListeners();
+                                    })();
+                                    """.trimIndent(),
+                                    null
+                                )
                             }
 
                             override fun shouldOverrideUrlLoading(
@@ -1123,6 +1321,28 @@ class MainActivity : ComponentActivity() {
                                 request: WebResourceRequest?
                             ): Boolean {
                                 val url = request?.url?.toString() ?: return false
+                                
+                                // Check if it's a video link
+                                val lowercaseUrl = url.lowercase()
+                                val isVideoLink = lowercaseUrl.endsWith(".mp4") || lowercaseUrl.endsWith(".webm") || 
+                                                  lowercaseUrl.endsWith(".mkv") || lowercaseUrl.endsWith(".avi") || 
+                                                  lowercaseUrl.endsWith(".mov") || lowercaseUrl.endsWith(".3gp") ||
+                                                  lowercaseUrl.contains(".mp4?") || lowercaseUrl.contains(".webm?") ||
+                                                  lowercaseUrl.contains(".mkv?") || lowercaseUrl.contains(".avi?") ||
+                                                  lowercaseUrl.contains(".mov?") || lowercaseUrl.contains(".3gp?")
+                                
+                                if (isVideoLink) {
+                                    globalOnVideoUrlDetected?.invoke(
+                                        PendingVideoDownload(
+                                            url = url,
+                                            userAgent = view?.settings?.userAgentString,
+                                            contentDisposition = null,
+                                            mimetype = if (lowercaseUrl.contains("mp4")) "video/mp4" else if (lowercaseUrl.contains("webm")) "video/webm" else "video/*"
+                                        )
+                                    )
+                                    return true
+                                }
+
                                 if (url.contains("facebook.com") || url.contains("messenger.com") ||
                                     url.contains("fb.com") || url.contains("fb.me")
                                 ) {
@@ -1276,33 +1496,53 @@ class MainActivity : ComponentActivity() {
 
                         setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
                             try {
-                                val filename = URLUtil.guessFileName(url, contentDisposition, mimetype)
-                                val request = DownloadManager.Request(Uri.parse(url)).apply {
-                                    setMimeType(mimetype)
-                                    val cookies = CookieManager.getInstance().getCookie(url)
-                                    addRequestHeader("cookie", cookies)
-                                    addRequestHeader("User-Agent", userAgent)
-                                    setDescription("Downloading $filename...")
-                                    setTitle(filename)
-                                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                                    setDestinationInExternalPublicDir(
-                                        Environment.DIRECTORY_DOWNLOADS,
-                                        filename
-                                    )
-                                }
-
-                                val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                                val id = dm.enqueue(request)
-                                webViewDownloadsMap[id] = filename
+                                val lowercaseUrl = url.lowercase()
+                                val isVideo = mimetype.startsWith("video/") || 
+                                              lowercaseUrl.contains(".mp4") || 
+                                              lowercaseUrl.contains(".webm") || 
+                                              lowercaseUrl.contains(".mkv") ||
+                                              lowercaseUrl.contains(".avi") ||
+                                              lowercaseUrl.contains(".mov") ||
+                                              lowercaseUrl.contains(".3gp")
                                 
-                                showNotification(
-                                    notificationId = id.toInt(),
-                                    title = "Download Started",
-                                    text = "Downloading $filename...",
-                                    icon = android.R.drawable.stat_sys_download,
-                                    soundAndVibrate = true
-                                )
-                                Toast.makeText(ctx, "Starting download...", Toast.LENGTH_SHORT).show()
+                                if (isVideo) {
+                                    globalOnVideoUrlDetected?.invoke(
+                                        PendingVideoDownload(
+                                            url = url,
+                                            userAgent = userAgent,
+                                            contentDisposition = contentDisposition,
+                                            mimetype = mimetype
+                                        )
+                                    )
+                                } else {
+                                    val filename = URLUtil.guessFileName(url, contentDisposition, mimetype)
+                                    val request = DownloadManager.Request(Uri.parse(url)).apply {
+                                        setMimeType(mimetype)
+                                        val cookies = CookieManager.getInstance().getCookie(url)
+                                        addRequestHeader("cookie", cookies)
+                                        addRequestHeader("User-Agent", userAgent)
+                                        setDescription("Downloading $filename...")
+                                        setTitle(filename)
+                                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                        setDestinationInExternalPublicDir(
+                                            Environment.DIRECTORY_DOWNLOADS,
+                                            filename
+                                        )
+                                    }
+
+                                    val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                                    val id = dm.enqueue(request)
+                                    webViewDownloadsMap[id] = filename
+                                    
+                                    showNotification(
+                                        notificationId = id.toInt(),
+                                        title = "Download Started",
+                                        text = "Downloading $filename...",
+                                        icon = android.R.drawable.stat_sys_download,
+                                        soundAndVibrate = true
+                                    )
+                                    Toast.makeText(ctx, "Starting download...", Toast.LENGTH_SHORT).show()
+                                }
                             } catch (e: Exception) {
                                 showNotification(
                                     notificationId = System.currentTimeMillis().toInt(),
