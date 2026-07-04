@@ -68,6 +68,17 @@ import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
+import java.net.HttpURLConnection
+import java.net.URL
+import org.json.JSONObject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
+import android.provider.Settings
+import androidx.lifecycle.lifecycleScope
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 
 class MainActivity : ComponentActivity() {
 
@@ -75,6 +86,154 @@ class MainActivity : ComponentActivity() {
     private var webViewInstance: WebView? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var cameraPhotoPath: String? = null
+
+    val currentVersionCode: Long by lazy {
+        try {
+            val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                packageManager.getPackageInfo(packageName, 0)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                packageInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                packageInfo.versionCode.toLong()
+            }
+        } catch (e: Exception) {
+            1L
+        }
+    }
+
+    val currentVersionName: String by lazy {
+        try {
+            val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                packageManager.getPackageInfo(packageName, 0)
+            }
+            packageInfo.versionName ?: "1.0"
+        } catch (e: Exception) {
+            "1.0"
+        }
+    }
+
+    private suspend fun performUpdateCheck(urlStr: String): UpdateInfo? {
+        return withContext(Dispatchers.IO) {
+            var connection: HttpURLConnection? = null
+            try {
+                val url = URL(urlStr)
+                connection = url.openConnection() as HttpURLConnection
+                connection.connectTimeout = 8000
+                connection.readTimeout = 8000
+                connection.requestMethod = "GET"
+                
+                if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+                    val jsonText = connection.inputStream.bufferedReader().use { it.readText() }
+                    val json = JSONObject(jsonText)
+                    UpdateInfo(
+                        versionCode = json.getInt("versionCode"),
+                        versionName = json.getString("versionName"),
+                        downloadUrl = json.getString("downloadUrl"),
+                        updateMessage = json.optString("updateMessage", "A new version of the app is available. Please update to continue enjoying the latest features.")
+                    )
+                } else {
+                    null
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                null
+            } finally {
+                connection?.disconnect()
+            }
+        }
+    }
+
+    private suspend fun downloadUpdateApk(
+        downloadUrl: String,
+        destFile: File,
+        onProgress: (Float, Long, Long) -> Unit
+    ) {
+        withContext(Dispatchers.IO) {
+            var connection: HttpURLConnection? = null
+            try {
+                if (destFile.exists()) {
+                    destFile.delete()
+                }
+                
+                val url = URL(downloadUrl)
+                connection = url.openConnection() as HttpURLConnection
+                connection.connectTimeout = 15000
+                connection.readTimeout = 30000
+                connection.connect()
+
+                if (connection.responseCode != HttpURLConnection.HTTP_OK) {
+                    throw IOException("Server returned HTTP ${connection.responseCode}")
+                }
+
+                val length = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    connection.contentLengthLong
+                } else {
+                    connection.contentLength.toLong()
+                }
+
+                connection.inputStream.use { input ->
+                    destFile.outputStream().use { output ->
+                        val buffer = ByteArray(4096)
+                        var total: Long = 0
+                        var count: Int
+                        while (input.read(buffer).also { count = it } != -1) {
+                            if (!coroutineContext.isActive) {
+                                throw IOException("Download cancelled")
+                            }
+                            total += count
+                            output.write(buffer, 0, count)
+                            onProgress(
+                                if (length > 0) total.toFloat() / length else -1f,
+                                total,
+                                length
+                            )
+                        }
+                    }
+                }
+            } finally {
+                connection?.disconnect()
+            }
+        }
+    }
+
+    private fun triggerInstall(context: Context, file: File) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (!context.packageManager.canRequestPackageInstalls()) {
+                Toast.makeText(context, "Please enable 'Install unknown apps' permission to update.", Toast.LENGTH_LONG).show()
+                val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+                return
+            }
+        }
+
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file
+        )
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(context, "Failed to launch installer: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
 
     // Launchers for Runtime Permissions and File Chooser
     private val requestPermissionsLauncher = registerForActivityResult(
@@ -126,6 +285,55 @@ class MainActivity : ComponentActivity() {
                 var showMenu by remember { mutableStateOf(false) }
                 var currentUrl by remember { mutableStateOf("https://m.facebook.com") }
                 var urlInputText by remember { mutableStateOf("https://m.facebook.com") }
+
+                // --- Self-Update System States ---
+                var updateState by remember { mutableStateOf<UpdateSystemState>(UpdateSystemState.Idle) }
+                var updateProgress by remember { mutableStateOf(0f) }
+                var downloadedBytesStr by remember { mutableStateOf("") }
+                var updateJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+                val coroutineScope = rememberCoroutineScope()
+                val context = LocalContext.current
+
+                // Check for updates on startup
+                LaunchedEffect(Unit) {
+                    delay(3500) // Let splash screen load cleanly
+                    coroutineScope.launch {
+                        val info = performUpdateCheck("https://raw.githubusercontent.com/sheilaj08102/fb-lite-updater/main/update.json")
+                        if (info != null && info.versionCode > currentVersionCode) {
+                            updateState = UpdateSystemState.UpdateAvailable(info)
+                        }
+                    }
+                }
+
+                fun startUpdateDownload(info: UpdateInfo) {
+                    updateState = UpdateSystemState.Downloading(info)
+                    updateProgress = 0f
+                    downloadedBytesStr = "Starting download..."
+                    
+                    updateJob = coroutineScope.launch {
+                        try {
+                            val apkFile = File(context.cacheDir, "app-update.apk")
+                            downloadUpdateApk(info.downloadUrl, apkFile) { progress, totalBytes, totalLength ->
+                                updateProgress = progress
+                                val currentMb = totalBytes.toFloat() / (1024 * 1024)
+                                val totalMb = totalLength.toFloat() / (1024 * 1024)
+                                val percent = progress * 100
+                                downloadedBytesStr = if (totalLength > 0) {
+                                    String.format(Locale.getDefault(), "%.2f MB / %.2f MB (%.0f%%)", currentMb, totalMb, percent)
+                                } else {
+                                    String.format(Locale.getDefault(), "%.2f MB downloaded", currentMb)
+                                }
+                            }
+                            updateState = UpdateSystemState.ReadyToInstall(info, apkFile)
+                        } catch (e: Exception) {
+                            if (e is java.io.InterruptedIOException || e.message?.contains("cancelled") == true) {
+                                updateState = UpdateSystemState.Idle
+                            } else {
+                                updateState = UpdateSystemState.Error("Failed to download update: ${e.message}", info)
+                            }
+                        }
+                    }
+                }
 
                 LaunchedEffect(currentUrl) {
                     urlInputText = currentUrl
@@ -365,7 +573,30 @@ class MainActivity : ComponentActivity() {
                                     canGoBack = canGoBack,
                                     canGoForward = webViewInstance?.canGoForward() ?: false,
                                     onGoBack = { webViewInstance?.goBack() },
-                                    onGoForward = { webViewInstance?.goForward() }
+                                    onGoForward = { webViewInstance?.goForward() },
+                                    currentVersionName = currentVersionName,
+                                    onCheckForUpdates = {
+                                        showMenu = false
+                                        coroutineScope.launch {
+                                            Toast.makeText(this@MainActivity, "Checking for updates...", Toast.LENGTH_SHORT).show()
+                                            val info = performUpdateCheck("https://raw.githubusercontent.com/sheilaj08102/fb-lite-updater/main/update.json")
+                                            if (info != null && info.versionCode > currentVersionCode) {
+                                                updateState = UpdateSystemState.UpdateAvailable(info)
+                                            } else {
+                                                Toast.makeText(this@MainActivity, "No updates available (Current version is up-to-date: v$currentVersionName)", Toast.LENGTH_LONG).show()
+                                            }
+                                        }
+                                    },
+                                    onSimulateUpdate = {
+                                        showMenu = false
+                                        val mockInfo = UpdateInfo(
+                                            versionCode = 999,
+                                            versionName = "9.9",
+                                            downloadUrl = "https://raw.githubusercontent.com/sheilaj08102/fb-lite-updater/main/dummy.apk",
+                                            updateMessage = "This is a simulated update to demonstrate the polished Material 3 self-update flow.\n\nIt features live download progress tracking, adaptive layouts, and a secure FileProvider installer trigger!"
+                                        )
+                                        updateState = UpdateSystemState.UpdateAvailable(mockInfo)
+                                    }
                                 )
                             }
                         }
@@ -396,6 +627,40 @@ class MainActivity : ComponentActivity() {
                     ) {
                         SplashScreenView(modifier = Modifier.fillMaxSize())
                     }
+
+                    // Self-Update Dialog Overlay
+                    UpdateDialogOverlay(
+                        state = updateState,
+                        progress = updateProgress,
+                        downloadedStr = downloadedBytesStr,
+                        onUpdateClick = {
+                            val state = updateState
+                            if (state is UpdateSystemState.UpdateAvailable) {
+                                startUpdateDownload(state.info)
+                            }
+                        },
+                        onLaterClick = {
+                            updateJob?.cancel()
+                            updateState = UpdateSystemState.Idle
+                        },
+                        onInstallClick = {
+                            val state = updateState
+                            if (state is UpdateSystemState.ReadyToInstall) {
+                                triggerInstall(context, state.localFile)
+                            }
+                        },
+                        onRetryClick = {
+                            val state = updateState
+                            if (state is UpdateSystemState.Error) {
+                                state.info?.let { startUpdateDownload(it) } ?: run {
+                                    updateState = UpdateSystemState.Idle
+                                }
+                            }
+                        },
+                        onDismissError = {
+                            updateState = UpdateSystemState.Idle
+                        }
+                    )
                 }
             }
         }
@@ -805,7 +1070,10 @@ fun SettingsOverlayMenu(
     canGoBack: Boolean,
     canGoForward: Boolean,
     onGoBack: () -> Unit,
-    onGoForward: () -> Unit
+    onGoForward: () -> Unit,
+    currentVersionName: String,
+    onCheckForUpdates: () -> Unit,
+    onSimulateUpdate: () -> Unit
 ) {
     Box(
         modifier = Modifier
@@ -1004,7 +1272,73 @@ fun SettingsOverlayMenu(
                             )
                         )
                         Text(
-                            text = "Fast lightweight browser engine.",
+                            text = "Fast lightweight browser engine. Version v$currentVersionName",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCAC4D0))
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                HorizontalDivider(color = Color(0xFF49454F))
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Check for updates option
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(onClick = onCheckForUpdates)
+                        .padding(vertical = 10.dp, horizontal = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "Check for updates icon",
+                        tint = Color(0xFFD0BCFF),
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(14.dp))
+                    Column {
+                        Text(
+                            text = "Check for Updates",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFFE6E1E5)
+                            )
+                        )
+                        Text(
+                            text = "Fetch online version manifest",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCAC4D0))
+                        )
+                    }
+                }
+
+                // Simulate update option
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(onClick = onSimulateUpdate)
+                        .padding(vertical = 10.dp, horizontal = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = "Simulate update icon",
+                        tint = Color(0xFFD0BCFF),
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(14.dp))
+                    Column {
+                        Text(
+                            text = "Simulate Self-Update",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFFE6E1E5)
+                            )
+                        )
+                        Text(
+                            text = "Demo update UI and progress bar",
                             style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCAC4D0))
                         )
                     }
@@ -1235,6 +1569,294 @@ fun NetworkErrorView(
                         fontWeight = FontWeight.SemiBold,
                         fontSize = 16.sp
                     )
+                }
+            }
+        }
+    }
+}
+
+sealed class UpdateSystemState {
+    object Idle : UpdateSystemState()
+    data class UpdateAvailable(val info: UpdateInfo) : UpdateSystemState()
+    data class Downloading(val info: UpdateInfo) : UpdateSystemState()
+    data class ReadyToInstall(val info: UpdateInfo, val localFile: File) : UpdateSystemState()
+    data class Error(val message: String, val info: UpdateInfo?) : UpdateSystemState()
+}
+
+data class UpdateInfo(
+    val versionCode: Int,
+    val versionName: String,
+    val downloadUrl: String,
+    val updateMessage: String
+)
+
+@Composable
+fun UpdateDialogOverlay(
+    state: UpdateSystemState,
+    progress: Float,
+    downloadedStr: String,
+    onUpdateClick: () -> Unit,
+    onLaterClick: () -> Unit,
+    onInstallClick: () -> Unit,
+    onRetryClick: () -> Unit,
+    onDismissError: () -> Unit
+) {
+    if (state is UpdateSystemState.Idle) return
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.6f))
+            .clickable(enabled = false) {}, // prevent click-through
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth(0.88f)
+                .padding(16.dp),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF2B2930)),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                // Top Icon
+                Box(
+                    modifier = Modifier
+                        .size(56.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFF49454F)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = when (state) {
+                            is UpdateSystemState.UpdateAvailable -> Icons.Default.Refresh
+                            is UpdateSystemState.Downloading -> Icons.Default.Refresh
+                            is UpdateSystemState.ReadyToInstall -> Icons.Default.Check
+                            is UpdateSystemState.Error -> Icons.Default.Warning
+                            else -> Icons.Default.Info
+                        },
+                        contentDescription = "Update Status Icon",
+                        tint = if (state is UpdateSystemState.Error) Color(0xFFF2B8B5) else Color(0xFFD0BCFF),
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Title
+                val titleText = when (state) {
+                    is UpdateSystemState.UpdateAvailable -> "New Update Available"
+                    is UpdateSystemState.Downloading -> "Downloading Update"
+                    is UpdateSystemState.ReadyToInstall -> "Update Ready to Install"
+                    is UpdateSystemState.Error -> "Update Failed"
+                    else -> ""
+                }
+
+                Text(
+                    text = titleText,
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFE6E1E5),
+                        textAlign = TextAlign.Center
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Content Description
+                when (state) {
+                    is UpdateSystemState.UpdateAvailable -> {
+                        val info = state.info
+                        Text(
+                            text = "Version v${info.versionName} is now available.",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFFD0BCFF)
+                            )
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = info.updateMessage,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFFCAC4D0),
+                                textAlign = TextAlign.Center,
+                                lineHeight = 18.sp
+                            )
+                        )
+                    }
+                    is UpdateSystemState.Downloading -> {
+                        Text(
+                            text = "Please wait while the update is being downloaded.",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFFCAC4D0),
+                                textAlign = TextAlign.Center
+                            )
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        
+                        if (progress >= 0f) {
+                            LinearProgressIndicator(
+                                progress = progress,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(8.dp)
+                                    .clip(RoundedCornerShape(4.dp)),
+                                color = Color(0xFFD0BCFF),
+                                trackColor = Color(0xFF49454F)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = downloadedStr,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFFD0BCFF),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
+                        } else {
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(8.dp)
+                                    .clip(RoundedCornerShape(4.dp)),
+                                color = Color(0xFFD0BCFF),
+                                trackColor = Color(0xFF49454F)
+                            )
+                        }
+                    }
+                    is UpdateSystemState.ReadyToInstall -> {
+                        val info = state.info
+                        Text(
+                            text = "The update to version v${info.versionName} has been downloaded successfully. Click Install below to apply the update.",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFFCAC4D0),
+                                textAlign = TextAlign.Center,
+                                lineHeight = 18.sp
+                            )
+                        )
+                    }
+                    is UpdateSystemState.Error -> {
+                        Text(
+                            text = state.message,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFFF2B8B5),
+                                textAlign = TextAlign.Center
+                            )
+                        )
+                    }
+                    else -> {}
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                // Actions Button Row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    when (state) {
+                        is UpdateSystemState.UpdateAvailable -> {
+                            // Later button
+                            Button(
+                                onClick = onLaterClick,
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFF49454F),
+                                    contentColor = Color(0xFFE6E1E5)
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Later")
+                            }
+
+                            // Update Now button
+                            Button(
+                                onClick = onUpdateClick,
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFD0BCFF),
+                                    contentColor = Color(0xFF21005D)
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Update Now", fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        is UpdateSystemState.Downloading -> {
+                            // Cancel button
+                            Button(
+                                onClick = onLaterClick, // behaves as cancel
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFF49454F),
+                                    contentColor = Color(0xFFE6E1E5)
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Cancel")
+                            }
+                        }
+                        is UpdateSystemState.ReadyToInstall -> {
+                            // Later button
+                            Button(
+                                onClick = onLaterClick,
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFF49454F),
+                                    contentColor = Color(0xFFE6E1E5)
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Dismiss")
+                            }
+
+                            // Install button
+                            Button(
+                                onClick = onInstallClick,
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFD0BCFF),
+                                    contentColor = Color(0xFF21005D)
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Install Now", fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        is UpdateSystemState.Error -> {
+                            // Close button
+                            Button(
+                                onClick = onDismissError,
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFF49454F),
+                                    contentColor = Color(0xFFE6E1E5)
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Close")
+                            }
+
+                            // Retry button
+                            Button(
+                                onClick = onRetryClick,
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFD0BCFF),
+                                    contentColor = Color(0xFF21005D)
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Retry", fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        else -> {}
+                    }
                 }
             }
         }

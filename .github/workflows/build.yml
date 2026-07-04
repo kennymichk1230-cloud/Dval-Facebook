@@ -3,35 +3,51 @@ name: Build Android APK
 on:
   push:
     branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: 17
-          cache: gradle
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
 
-      - name: Restore Gradle Wrapper
+      - name: Heal Gradle Wrapper (Fix corrupt or missing Jar)
         run: |
+          echo "Checking and healing Gradle Wrapper..."
           mkdir -p gradle/wrapper
-          curl -L https://raw.githubusercontent.com/gradle/gradle/master/gradle/wrapper/gradle-wrapper.jar -o gradle/wrapper/gradle-wrapper.jar
+          
+          # Attempt to download a pristine gradle-wrapper.jar from official Gradle sources.
+          # We use curl with -f (fail) so that it returns a non-zero exit code if the URL 404s,
+          # allowing the fallback to the master branch to execute correctly. This bypasses
+          # any binary corruption from phone uploads or Git line-ending conversion issues.
+          curl -f -sSL -o gradle/wrapper/gradle-wrapper.jar "https://raw.githubusercontent.com/gradle/gradle/v9.3.1/gradle/wrapper/gradle-wrapper.jar" || \
+          curl -f -sSL -o gradle/wrapper/gradle-wrapper.jar "https://raw.githubusercontent.com/gradle/gradle/master/gradle/wrapper/gradle-wrapper.jar"
+          
+          # Ensure execution permission for the Gradle wrapper script
           chmod +x gradlew
 
-      - name: Decode Signing Key
-        run: |
-          echo "${{ secrets.SIGNING_KEY }}" | base64 -d > app/release.jks
+      - name: Build with Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: wrapper
 
-      - name: Build APK
+      - name: Decode Keystore
+        if: ${{ secrets.SIGNING_KEY != '' }}
+        run: |
+          echo -n "${{ secrets.SIGNING_KEY }}" | base64 --decode > app/release.jks
+
+      - name: Build Release APK
         env:
           KEYSTORE_PATH: ${{ github.workspace }}/app/release.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -39,9 +55,8 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v${{ github.run_number }}
-          name: Release v${{ github.run_number }}
-          files: app/build/outputs/apk/release/*.apk
+          name: release-apk
+          path: app/build/outputs/apk/release/app-release.apk
