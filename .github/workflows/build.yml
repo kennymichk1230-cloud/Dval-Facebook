@@ -26,10 +26,15 @@ jobs:
         run: |
           echo "Checking and healing Gradle Wrapper..."
           mkdir -p gradle/wrapper
-
+          
+          # Attempt to download a pristine gradle-wrapper.jar from official Gradle sources.
+          # We use curl with -f (fail) so that it returns a non-zero exit code if the URL 404s,
+          # allowing the fallback to the master branch to execute correctly. This bypasses
+          # any binary corruption from phone uploads or Git line-ending conversion issues.
           curl -f -sSL -o gradle/wrapper/gradle-wrapper.jar "https://raw.githubusercontent.com/gradle/gradle/v9.3.1/gradle/wrapper/gradle-wrapper.jar" || \
           curl -f -sSL -o gradle/wrapper/gradle-wrapper.jar "https://raw.githubusercontent.com/gradle/gradle/master/gradle/wrapper/gradle-wrapper.jar"
-
+          
+          # Ensure execution permission for the Gradle wrapper script
           chmod +x gradlew
 
       - name: Build with Gradle
@@ -38,12 +43,9 @@ jobs:
           gradle-version: wrapper
 
       - name: Decode Keystore
-        env:
-          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        if: ${{ secrets.SIGNING_KEY != '' }}
         run: |
-          if [ -n "$SIGNING_KEY" ]; then
-            echo "$SIGNING_KEY" | base64 --decode > app/release.jks
-          fi
+          echo -n "${{ secrets.SIGNING_KEY }}" | base64 --decode > app/release.jks
 
       - name: Build Release APK
         env:

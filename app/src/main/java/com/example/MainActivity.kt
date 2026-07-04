@@ -79,6 +79,11 @@ import android.provider.Settings
 import androidx.lifecycle.lifecycleScope
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 
 class MainActivity : ComponentActivity() {
 
@@ -86,6 +91,258 @@ class MainActivity : ComponentActivity() {
     private var webViewInstance: WebView? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var cameraPhotoPath: String? = null
+
+    // Notification and update callbacks
+    private val webViewDownloadsMap = mutableMapOf<Long, String>()
+    private var updateDownloadId: Long = -1L
+    private var updateInfoPending: UpdateInfo? = null
+    private var globalStartUpdateDownload: ((UpdateInfo) -> Unit)? = null
+    private var onUpdateDownloadFinished: ((UpdateInfo, File) -> Unit)? = null
+    private var onUpdateDownloadFailed: ((String, UpdateInfo?) -> Unit)? = null
+
+    private val downloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val action = intent.action
+            if (DownloadManager.ACTION_DOWNLOAD_COMPLETE == action) {
+                val downloadId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+                if (downloadId == -1L) return
+
+                val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                val query = DownloadManager.Query().setFilterById(downloadId)
+                val cursor = downloadManager.query(query)
+                if (cursor != null && cursor.moveToFirst()) {
+                    val statusColumn = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                    val status = if (statusColumn != -1) cursor.getInt(statusColumn) else -1
+                    
+                    if (downloadId == updateDownloadId) {
+                        val info = updateInfoPending
+                        if (info != null) {
+                            if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                                showNotification(
+                                    notificationId = 10001,
+                                    title = "Update Download Completed",
+                                    text = "Successfully downloaded FB Lite v${info.versionName}",
+                                    icon = android.R.drawable.stat_sys_download_done,
+                                    pendingIntent = createInstallPendingIntent(context, info),
+                                    soundAndVibrate = true
+                                )
+                                showNotification(
+                                    notificationId = 10002,
+                                    title = "Update Ready to Install",
+                                    text = "Click to install version v${info.versionName} now.",
+                                    icon = android.R.drawable.stat_sys_download_done,
+                                    pendingIntent = createInstallPendingIntent(context, info),
+                                    soundAndVibrate = true
+                                )
+                                val destFile = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "app-update.apk")
+                                runOnUiThread {
+                                    onUpdateDownloadFinished?.invoke(info, destFile)
+                                }
+                            } else if (status == DownloadManager.STATUS_FAILED) {
+                                val reasonColumn = cursor.getColumnIndex(DownloadManager.COLUMN_REASON)
+                                val reason = if (reasonColumn != -1) cursor.getInt(reasonColumn) else -1
+                                showNotification(
+                                    notificationId = 10001,
+                                    title = "Update Download Failed",
+                                    text = "Could not download update. Code: $reason",
+                                    icon = android.R.drawable.stat_notify_error,
+                                    soundAndVibrate = true
+                                )
+                                runOnUiThread {
+                                    onUpdateDownloadFailed?.invoke("Download failed with code: $reason", info)
+                                }
+                            }
+                        }
+                    } else if (webViewDownloadsMap.containsKey(downloadId)) {
+                        val filename = webViewDownloadsMap[downloadId] ?: "file"
+                        webViewDownloadsMap.remove(downloadId)
+                        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                            showNotification(
+                                notificationId = downloadId.toInt(),
+                                title = "Download Completed",
+                                text = "Successfully downloaded $filename",
+                                icon = android.R.drawable.stat_sys_download_done,
+                                pendingIntent = createOpenFilePendingIntent(context, downloadId),
+                                soundAndVibrate = true
+                            )
+                        } else if (status == DownloadManager.STATUS_FAILED) {
+                            showNotification(
+                                notificationId = downloadId.toInt(),
+                                title = "Download Failed",
+                                text = "Failed to download $filename",
+                                icon = android.R.drawable.stat_notify_error,
+                                soundAndVibrate = true
+                            )
+                        }
+                    }
+                }
+                cursor?.close()
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent == null) return
+        if ("com.example.INSTALL_UPDATE" == intent.action) {
+            val filePath = intent.getStringExtra("filePath")
+            if (filePath != null) {
+                val file = File(filePath)
+                if (file.exists()) {
+                    triggerInstall(this, file)
+                }
+            }
+        } else if ("com.example.START_UPDATE_DOWNLOAD" == intent.action) {
+            val downloadUrl = intent.getStringExtra("downloadUrl")
+            val versionName = intent.getStringExtra("versionName")
+            val body = intent.getStringExtra("body")
+            if (downloadUrl != null && versionName != null) {
+                val info = UpdateInfo(
+                    versionCode = 0,
+                    versionName = versionName,
+                    downloadUrl = downloadUrl,
+                    updateMessage = body ?: "A new update is available."
+                )
+                runOnUiThread {
+                    globalStartUpdateDownload?.invoke(info)
+                }
+            }
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channelId = "downloads_and_updates"
+            val channelName = "Downloads and Updates"
+            val descriptionText = "Notifications for download status and in-app updates"
+            val importance = NotificationManager.IMPORTANCE_HIGH
+            val channel = NotificationChannel(channelId, channelName, importance).apply {
+                description = descriptionText
+                enableLights(true)
+                lightColor = android.graphics.Color.parseColor("#800080")
+                enableVibration(true)
+                vibrationPattern = longArrayOf(100, 200, 300, 400)
+                val defaultUri = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
+                val audioAttributes = android.media.AudioAttributes.Builder()
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+                    .build()
+                setSound(defaultUri, audioAttributes)
+            }
+            val notificationManager: NotificationManager =
+                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun showNotification(
+        notificationId: Int,
+        title: String,
+        text: String,
+        icon: Int = android.R.drawable.stat_sys_download_done,
+        pendingIntent: PendingIntent? = null,
+        soundAndVibrate: Boolean = true
+    ) {
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val builder = androidx.core.app.NotificationCompat.Builder(this, "downloads_and_updates")
+            .setSmallIcon(icon)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setAutoCancel(true)
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+            .setCategory(androidx.core.app.NotificationCompat.CATEGORY_MESSAGE)
+
+        if (pendingIntent != null) {
+            builder.setContentIntent(pendingIntent)
+        }
+
+        if (soundAndVibrate) {
+            builder.setSound(android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION))
+            builder.setVibrate(longArrayOf(100, 200, 300, 400))
+        }
+
+        notificationManager.notify(notificationId, builder.build())
+    }
+
+    private fun createOpenFilePendingIntent(context: Context, downloadId: Long): PendingIntent? {
+        try {
+            val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            val uri = downloadManager.getUriForDownloadedFile(downloadId)
+            if (uri != null) {
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, downloadManager.getMimeTypeForDownloadedFile(downloadId) ?: "*/*")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                } else {
+                    PendingIntent.FLAG_UPDATE_CURRENT
+                }
+                return PendingIntent.getActivity(context, downloadId.toInt(), intent, flags)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return null
+    }
+
+    private fun createInstallPendingIntent(context: Context, info: UpdateInfo): PendingIntent {
+        val destFile = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "app-update.apk")
+        val intent = Intent(context, MainActivity::class.java).apply {
+            action = "com.example.INSTALL_UPDATE"
+            putExtra("versionName", info.versionName)
+            putExtra("filePath", destFile.absolutePath)
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        return PendingIntent.getActivity(context, 10002, intent, flags)
+    }
+
+    private fun showUpdateNotification(context: Context, info: UpdateInfo) {
+        val clickIntent = Intent(context, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val clickFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val clickPendingIntent = PendingIntent.getActivity(context, 20001, clickIntent, clickFlags)
+
+        val updateIntent = Intent(context, MainActivity::class.java).apply {
+            action = "com.example.START_UPDATE_DOWNLOAD"
+            putExtra("downloadUrl", info.downloadUrl)
+            putExtra("versionName", info.versionName)
+            putExtra("body", info.updateMessage)
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val updatePendingIntent = PendingIntent.getActivity(context, 20002, updateIntent, clickFlags)
+
+        val builder = androidx.core.app.NotificationCompat.Builder(context, "downloads_and_updates")
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentTitle("New Update Available")
+            .setContentText("FB Lite v${info.versionName} is now available.")
+            .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText("Version v${info.versionName} is now available.\n\n${info.updateMessage}"))
+            .setAutoCancel(true)
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(clickPendingIntent)
+            .addAction(android.R.drawable.stat_sys_download, "Update Now", updatePendingIntent)
+            .setSound(android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION))
+            .setVibrate(longArrayOf(100, 200, 300, 400))
+
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(10000, builder.build())
+    }
 
     val currentVersionCode: Long by lazy {
         try {
@@ -267,6 +524,20 @@ class MainActivity : ComponentActivity() {
         // Full Edge-to-Edge immersion
         enableEdgeToEdge()
 
+        // Create the notification channel
+        createNotificationChannel()
+
+        // Register the download broadcast receiver
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(downloadReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(downloadReceiver, filter)
+        }
+
+        // Process any launch intent
+        handleIntent(intent)
+
         // Request permissions on startup for smooth experience
         requestRequiredPermissions()
 
@@ -289,13 +560,32 @@ class MainActivity : ComponentActivity() {
                 val coroutineScope = rememberCoroutineScope()
                 val context = LocalContext.current
 
-                // Check for updates on startup
+                // Check for updates on startup and once every 24 hours
                 LaunchedEffect(Unit) {
                     delay(3500) // Let splash screen load cleanly
                     coroutineScope.launch {
-                        val info = performUpdateCheck()
-                        if (info != null && isNewerVersion(currentVersionName, info.versionName)) {
-                            updateState = UpdateSystemState.UpdateAvailable(info)
+                        val sharedPrefs = context.getSharedPreferences("app_settings", Context.MODE_PRIVATE)
+                        
+                        suspend fun runCheck() {
+                            val info = performUpdateCheck()
+                            if (info != null && isNewerVersion(currentVersionName, info.versionName)) {
+                                updateState = UpdateSystemState.UpdateAvailable(info)
+                                showUpdateNotification(context, info)
+                            }
+                            sharedPrefs.edit().putLong("last_update_check_time", System.currentTimeMillis()).apply()
+                        }
+
+                        // Always check on startup
+                        runCheck()
+
+                        // Check periodically every 24 hours
+                        while (isActive) {
+                            delay(60 * 60 * 1000) // check hourly if the 24 hours has passed
+                            val lastCheck = sharedPrefs.getLong("last_update_check_time", 0L)
+                            val now = System.currentTimeMillis()
+                            if (now - lastCheck >= 24 * 60 * 60 * 1000) {
+                                runCheck()
+                            }
                         }
                     }
                 }
@@ -321,6 +611,16 @@ class MainActivity : ComponentActivity() {
                             }
                             
                             val downloadId = downloadManager.enqueue(request)
+                            this@MainActivity.updateDownloadId = downloadId
+                            this@MainActivity.updateInfoPending = info
+                            
+                            showNotification(
+                                notificationId = 10001,
+                                title = "Update Download Started",
+                                text = "Downloading FB Lite v${info.versionName}...",
+                                icon = android.R.drawable.stat_sys_download,
+                                soundAndVibrate = true
+                            )
                             
                             var downloading = true
                             while (downloading && isActive) {
@@ -363,6 +663,20 @@ class MainActivity : ComponentActivity() {
                                 updateState = UpdateSystemState.Error("Failed to download update: ${e.message}", info)
                             }
                         }
+                    }
+                }
+
+                // Bind activity callbacks to Compose states
+                SideEffect {
+                    globalStartUpdateDownload = { info ->
+                        startUpdateDownload(info)
+                    }
+                    onUpdateDownloadFinished = { info, localFile ->
+                        updateProgress = 1f
+                        updateState = UpdateSystemState.ReadyToInstall(info, localFile)
+                    }
+                    onUpdateDownloadFailed = { errorStr, info ->
+                        updateState = UpdateSystemState.Error(errorStr, info)
                     }
                 }
 
@@ -962,24 +1276,41 @@ class MainActivity : ComponentActivity() {
 
                         setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
                             try {
+                                val filename = URLUtil.guessFileName(url, contentDisposition, mimetype)
                                 val request = DownloadManager.Request(Uri.parse(url)).apply {
                                     setMimeType(mimetype)
                                     val cookies = CookieManager.getInstance().getCookie(url)
                                     addRequestHeader("cookie", cookies)
                                     addRequestHeader("User-Agent", userAgent)
-                                    setDescription("Downloading file...")
-                                    setTitle(URLUtil.guessFileName(url, contentDisposition, mimetype))
+                                    setDescription("Downloading $filename...")
+                                    setTitle(filename)
                                     setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                                     setDestinationInExternalPublicDir(
                                         Environment.DIRECTORY_DOWNLOADS,
-                                        URLUtil.guessFileName(url, contentDisposition, mimetype)
+                                        filename
                                     )
                                 }
 
                                 val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                                dm.enqueue(request)
+                                val id = dm.enqueue(request)
+                                webViewDownloadsMap[id] = filename
+                                
+                                showNotification(
+                                    notificationId = id.toInt(),
+                                    title = "Download Started",
+                                    text = "Downloading $filename...",
+                                    icon = android.R.drawable.stat_sys_download,
+                                    soundAndVibrate = true
+                                )
                                 Toast.makeText(ctx, "Starting download...", Toast.LENGTH_SHORT).show()
                             } catch (e: Exception) {
+                                showNotification(
+                                    notificationId = System.currentTimeMillis().toInt(),
+                                    title = "Download Failed",
+                                    text = "Could not start download: ${e.message}",
+                                    icon = android.R.drawable.stat_notify_error,
+                                    soundAndVibrate = true
+                                )
                                 Toast.makeText(ctx, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
                             }
                         }
